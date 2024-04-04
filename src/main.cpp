@@ -2,12 +2,21 @@
 #include <WiFiClient.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266WebServer.h>
+#include <arduino-timer.h>
 
 ESP8266WebServer server(80); // Create a webserver object that listens for HTTP request on port 80
 
 const int led = D0;
 const char *ssid = "SprinklerSystem";
 const char *password = "1234567890";
+
+const int SPRINKLER_RELAY = LED_BUILTIN;
+
+// Definition of Volatile variables and timers
+volatile int vcountdownTimer = 0;
+volatile int vsprinklerDuration = 0;
+
+auto timer = timer_create_default();
 
 const char rootPage[] PROGMEM = R"(
 <!DOCTYPE html>
@@ -18,10 +27,10 @@ const char rootPage[] PROGMEM = R"(
 <h2>Settings</h2>
 <form action="/SPRINKLER" method="post">
   <label for="timer">Set Timer (seconds):</label>
-  <input type="number" id="timer" name="timer" min="1" value="10">
+  <input type="number" id="timer" name="timer" min="1" value="30">
   <br><br>
   <label for="duration">Set Duration of Sprinkler in (seconds):</label>
-  <input type="number" id="duration" name="duration" min="1" value="20">
+  <input type="number" id="duration" name="duration" min="1" value="10">
   <br><br>
   <input type="submit" value="Set Timer and Duration">
 </form>
@@ -86,18 +95,24 @@ const char statusPage[] PROGMEM = R"(
 </html>
 )";
 
-void handleRoot(); // function prototypes for HTTP handlers
+// Function declaration of WebServer callbacks
+void handleRoot();
 void handleSprinklerSettings();
 void handleStatusPage();
 void handleNotFound();
 
+// Function declaration of Timer callbacks
+bool toggleLed(void *);
+bool toggleSprinkler(void *);
+
 void setup(void)
 {
-  Serial.begin(115200); // Start the Serial communication to send messages to the computer
+  Serial.begin(115200);
   delay(10);
   Serial.println('\n');
 
-  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(SPRINKLER_RELAY, OUTPUT);
+  digitalWrite(SPRINKLER_RELAY, HIGH);
 
   WiFi.softAP(ssid, password);
 
@@ -113,6 +128,29 @@ void setup(void)
 void loop(void)
 {
   server.handleClient();
+  timer.tick();
+}
+
+bool toggleLed(void *)
+{
+  Serial.println("Toggle LED!");
+  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  return true;
+}
+
+bool toggleSprinkler(void *)
+{
+  Serial.printf("Turning on sprinkler for %d seconds \n", vsprinklerDuration / 1000);
+
+  digitalWrite(SPRINKLER_RELAY, LOW);
+
+  timer.in(vsprinklerDuration, [](void *) -> bool
+           { 
+            Serial.println("Turning off sprinkler now!!"); 
+            digitalWrite(SPRINKLER_RELAY, HIGH); 
+            return false; });
+
+  return true;
 }
 
 void handleRoot()
@@ -127,22 +165,39 @@ void handleStatusPage()
 
 void handleSprinklerSettings()
 {
-  Serial.println("EARL_DEBUG");
   if (server.args() > 0)
   {
     String timerStr = server.arg("timer");
     String durationStr = server.arg("duration");
     int timerValue = timerStr.toInt();
     int durationValue = durationStr.toInt();
-    if (timerValue > 0 && durationValue > 0)
+
+    // Assign timer and duration
+    vcountdownTimer = timerValue * 1000;
+    vsprinklerDuration = durationValue * 1000;
+
+    if (timerValue > 0 && durationValue > 0 && timerValue > durationValue)
     {
-      server.sendHeader("Location", "/STATUS?timer="+timerStr+"&duration="+durationStr);
+      timer.cancel();
+
+      // Create a task
+      timer.every(vcountdownTimer, toggleSprinkler);
+
+      Serial.printf("new countdown timer [ %s ] and sprinkler duration [ %s ]\n", timerStr.c_str(), durationStr.c_str());
+      server.sendHeader("Location", "/STATUS?timer=" + timerStr + "&duration=" + durationStr);
       server.send(303);
     }
     else
     {
       server.sendHeader("Location", "/");
-      server.send(400, "text/plain", "Invalid timer value");
+      if (timerValue <= 0 || durationValue <= 0)
+      {
+        server.send(400, "text/plain", "Invalid timer value");
+      }
+      else if (timerValue < durationValue)
+      {
+        server.send(400, "text/plain", "Timer value must be greater than duration value");
+      }
     }
   }
   else
